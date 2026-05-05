@@ -15,9 +15,13 @@ Usage
   python bot.py
 """
 
+import asyncio
 import json
 import logging
 import os
+
+from dotenv import load_dotenv
+load_dotenv()
 import re
 import subprocess
 import sys
@@ -40,10 +44,17 @@ def _ensure_on_path(exe: str, search_roots: list[Path]) -> None:
             os.environ["PATH"] = str(found.parent) + os.pathsep + os.environ.get("PATH", "")
             return
 
-_here = Path(__file__).parent
+_here = Path(__file__).resolve().parent
+# Search ancestors too so ffmpeg placed in a parent (e.g. main worktree) is found
+_search_roots = [_here] + list(_here.parents)[:4]
 _home = Path.home()
-_ensure_on_path("ffmpeg", [_here])
+_ensure_on_path("ffmpeg", _search_roots)
 _ensure_on_path("claude", [_home / ".local" / "bin", _home / "AppData" / "Local"])
+
+# Ensure CUDA 12 cuBLAS is on PATH for GPU inference (ctranslate2 needs it at runtime)
+_cuda_bin = Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6/bin")
+if _cuda_bin.exists() and str(_cuda_bin) not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = str(_cuda_bin) + os.pathsep + os.environ.get("PATH", "")
 
 import numpy as np
 import soundfile as sf
@@ -63,16 +74,18 @@ log = logging.getLogger(__name__)
 # ── Whisper model (loaded once at startup) ────────────────────────────────
 
 WHISPER_MODEL_SIZE = "small"
+# Set WHISPER_DEVICE=cuda in environment to enable GPU (CPU is default for safety)
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu").lower()
 _whisper: WhisperModel | None = None
 
 def get_whisper() -> WhisperModel:
     global _whisper
     if _whisper is None:
         import ctranslate2
-        if ctranslate2.get_cuda_device_count() > 0:
+        if WHISPER_DEVICE == "cuda" and ctranslate2.get_cuda_device_count() > 0:
             try:
-                _whisper = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
-                log.info("Whisper loaded on GPU (float16)")
+                _whisper = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="int8_float16")
+                log.info("Whisper loaded on GPU (int8_float16)")
                 return _whisper
             except RuntimeError as e:
                 log.warning(f"GPU load failed ({e}), falling back to CPU")
@@ -93,8 +106,11 @@ def to_wav(src: Path, dst: Path) -> None:
 
 # ── Step 2: transcribe, returning segments with timestamps ────────────────
 
-def transcribe(wav: Path) -> list[dict]:
-    """Return [{start, end, text}, ...] at segment granularity."""
+def transcribe(wav: Path, progress_cb=None) -> list[dict]:
+    """Return [{start, end, text}, ...] at segment granularity.
+
+    progress_cb(current_s, total_s) is called after each segment if provided.
+    """
     model = get_whisper()
     segments, info = model.transcribe(str(wav), word_timestamps=False)
     result = []
@@ -104,7 +120,50 @@ def transcribe(wav: Path) -> list[dict]:
             "end":   round(seg.end,   2),
             "text":  seg.text.strip(),
         })
-    log.info(f"Transcribed {info.duration:.0f}s → {len(result)} segments")
+        if progress_cb:
+            progress_cb(seg.end, info.duration)
+    log.info(f"Transcribed {info.duration:.0f}s -> {len(result)} segments")
+    return result
+
+
+async def transcribe_async(
+    wav: Path,
+    duration_s: float,
+    update_status,
+    source_name: str,
+) -> list[dict]:
+    """Run transcribe() in a thread executor, posting progress every ~5 s."""
+    loop = asyncio.get_running_loop()
+    last_update = [0.0]   # mutable cell for the closure
+    PROGRESS_INTERVAL = 5.0
+
+    def _progress(current_s: float, total_s: float) -> None:
+        now = time.time()
+        if now - last_update[0] >= PROGRESS_INTERVAL:
+            last_update[0] = now
+            pct = int(min(current_s, total_s) / total_s * 100) if total_s > 0 else 0
+            msg = (
+                f"*{source_name}* — transcribing "
+                f"{_fmt_mmss(current_s)} / {_fmt_mmss(total_s)} ({pct}%)..."
+            )
+            log.info(f"Transcription progress: {_fmt_mmss(current_s)} / {_fmt_mmss(total_s)} ({pct}%)")
+            fut = asyncio.run_coroutine_threadsafe(update_status(msg), loop)
+            fut.add_done_callback(
+                lambda f: log.warning("Progress update failed: %s", f.exception())
+                if f.exception() else None
+            )
+
+    t0 = time.time()
+    try:
+        result = await loop.run_in_executor(None, lambda: transcribe(wav, _progress))
+    except Exception as e:
+        log.warning("GPU transcription failed (%s), retrying on CPU", e)
+        global _whisper
+        _whisper = None  # force CPU reload on next get_whisper()
+        os.environ["WHISPER_DEVICE"] = "cpu"
+        await update_status(f"*{source_name}* — GPU error, retrying on CPU...")
+        result = await loop.run_in_executor(None, lambda: transcribe(wav, _progress))
+    log.info(f"Transcription took {time.time() - t0:.1f}s")
     return result
 
 
@@ -150,21 +209,27 @@ def _fmt_mmss(seconds: float) -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
-def extract_highlights(segments: list[dict]) -> list[dict]:
+async def extract_highlights(
+    segments: list[dict],
+    update_status=None,
+    source_name: str = "audio",
+) -> list[dict]:
     transcript = "\n".join(
         f"[{_fmt_mmss(s['start'])}] {s['text']}" for s in segments
     )
     prompt = HIGHLIGHT_PROMPT.format(transcript=transcript)
 
-    proc = subprocess.Popen(
-        [_claude_bin(), "--model", CLAUDE_MODEL, "-p", prompt],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, bufsize=1,
+    proc = await asyncio.create_subprocess_exec(
+        _claude_bin(), "--model", CLAUDE_MODEL, "-p", prompt,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
     )
 
     highlights = []
-    for line in proc.stdout:
-        line = line.strip()
+    last_status_update = 0.0
+
+    async for raw in proc.stdout:
+        line = raw.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:
@@ -172,10 +237,18 @@ def extract_highlights(segments: list[dict]) -> list[dict]:
             if "time_s" in h and "note" in h:
                 highlights.append(h)
                 log.info(f"  highlight {h.get('mm_ss','?')}  {h['note']}")
+                now = time.time()
+                if update_status and (now - last_status_update) >= 1.0:
+                    last_status_update = now
+                    found = len(highlights)
+                    await update_status(
+                        f"*{source_name}* — extracting highlights "
+                        f"({found} found so far...)"
+                    )
         except json.JSONDecodeError:
             pass
 
-    proc.wait()
+    await proc.wait()
     log.info(f"Extracted {len(highlights)} highlights")
     return highlights
 
@@ -293,16 +366,15 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update_status(
                 f"*{source_name}* — transcribing {_fmt_mmss(duration)}..."
             )
-            t0 = time.time()
-            segments = transcribe(wav)
-            elapsed = time.time() - t0
-            log.info(f"Transcription took {elapsed:.1f}s")
+            segments = await transcribe_async(wav, duration, update_status, source_name)
 
             # Highlights
             await update_status(
                 f"*{source_name}* — extracting highlights..."
             )
-            highlights = extract_highlights(segments)
+            highlights = await extract_highlights(
+                segments, update_status=update_status, source_name=source_name
+            )
 
             # Format
             text = format_transcript(segments, highlights, source_name, duration)
@@ -311,20 +383,41 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # Reply with file
             hl_count  = len(highlights)
             seg_count = len(segments)
-            await context.bot.send_document(
-                chat_id=chat_id,
-                document=InputFile(str(out), filename=out.name),
-                caption=(
-                    f"{_fmt_mmss(duration)} audio  •  "
-                    f"{seg_count} segments  •  "
-                    f"{hl_count} highlight{'s' if hl_count != 1 else ''}"
-                ),
-            )
+            with out.open("rb") as fh:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=InputFile(fh, filename=out.name),
+                    caption=(
+                        f"{_fmt_mmss(duration)} audio  •  "
+                        f"{seg_count} segments  •  "
+                        f"{hl_count} highlight{'s' if hl_count != 1 else ''}"
+                    ),
+                )
             await status.delete()
 
     except Exception as e:
         log.exception("Processing failed")
         await update_status(f"Error: `{e}`")
+
+
+def _has_audio(update) -> bool:
+    msg = update.message or update.channel_post
+    if not msg:
+        return False
+    return bool(msg.voice or msg.audio or (msg.document and msg.document.mime_type and msg.document.mime_type.startswith("audio/")))
+
+
+async def _post_init(app: Application) -> None:
+    pending = await app.bot.get_updates(timeout=0, limit=100,
+                                        allowed_updates=["message", "channel_post"])
+    if pending:
+        audio_count = sum(1 for u in pending if _has_audio(u))
+        total = len(pending)
+        log.info(
+            "Catch-up: %d pending update(s) in queue%s",
+            total,
+            f", {audio_count} with audio" if audio_count else " (no audio)",
+        )
 
 
 def main() -> None:
@@ -338,7 +431,7 @@ def main() -> None:
     log.info("Loading Whisper model...")
     get_whisper()
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(_post_init).build()
 
     # Handle both channel posts and group/private messages
     audio_filter = filters.VOICE | filters.AUDIO | filters.Document.AUDIO
@@ -348,7 +441,7 @@ def main() -> None:
     ))
 
     log.info("Bot started. Listening for audio files...")
-    app.run_polling(allowed_updates=["message", "channel_post"])
+    app.run_polling(allowed_updates=["message", "channel_post"], drop_pending_updates=False)
 
 
 if __name__ == "__main__":
