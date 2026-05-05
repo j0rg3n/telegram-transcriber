@@ -53,10 +53,48 @@ The bot looks for `claude` on PATH and also checks `~/.local/bin/claude`.
 
 ### Telegram bot token
 
-Create a bot via [@BotFather](https://t.me/BotFather) and copy the token.
+#### 1. Create the bot
 
-For the bot to see channel posts, add it as an **administrator** of the
-channel (read-only permissions are enough).
+1. Open Telegram and start a chat with [@BotFather](https://t.me/BotFather)
+2. Send `/newbot`
+3. Follow the prompts — choose a display name (e.g. `My Transcript Bot`) and
+   a username that ends in `bot` (e.g. `my_transcript_bot`)
+4. BotFather replies with a message like:
+
+   ```
+   Done! Congratulations on your new bot.
+   ...
+   Use this token to access the HTTP API:
+   1234567890:AAFxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+   ```
+
+5. Copy that token — you will need it in the [Running](#running) step
+
+#### 2. Allow the bot to read group/channel messages
+
+By default, bots only receive messages that directly mention them.
+To let TranscriptBot see all audio posted in a group or channel:
+
+**For groups:**
+
+1. In BotFather, send `/setprivacy`
+2. Select your bot
+3. Choose **Disable** — the bot will now receive all messages in groups it
+   belongs to
+4. Add the bot to your group (invite it as a member)
+
+**For channels:**
+
+Add the bot as an **administrator** of the channel — even read-only admin
+permissions are enough. Channel posts are always forwarded to admin bots
+regardless of the privacy setting.
+
+#### 3. (Optional) Disable the bot for public discovery
+
+If you want the bot to be private (only usable where you add it):
+
+1. In BotFather, send `/setjoingroups`
+2. Select your bot and choose **Disable**
 
 ## Setup
 
